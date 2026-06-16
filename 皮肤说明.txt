@@ -1,0 +1,64 @@
+皮肤插件用法
+================
+
+命令(需要 OP / 管理员)：
+  /skin set <玩家> <皮肤名>   给玩家套上皮肤，会广播给所有人，并记下来
+  /skin clear <玩家>          清掉记录，该玩家重新进服后变回原皮肤
+  /skin list                  列出 skins 目录里能用的皮肤
+  /skin reload                重新扫描 skins 目录并把已设置的皮肤重发一遍
+  /skin show <皮肤名>         在自己面前临时生成一个假人，展示这个皮肤(约 20 秒后消失)
+  /skin mem <玩家> <皮肤名>   实验性：用 ila 直接改服务器内存里的皮肤(SerializedSkinImpl::read)，
+                              符号已填，若没生效多半是 skin.js 顶部 MEM_OFF 的偏移要按你的版本核对
+
+前置依赖：本插件全程用 GMLIB 的二进制流发包(包头按版本对应，跨版本更稳)，所以必须装
+GMLIB-LegacyRemoteCallApi；/skin mem 还需要 iListenAttentively-LseExport。
+
+设置皮肤的原理：先给在线玩家发 PlayerSkin 包立即刷新，再改一遍玩家列表(PlayerList)；
+新玩家进服时会自动从玩家列表拿到正确皮肤。设置过的皮肤存进 players.json，玩家退了再进会自动补上。
+
+show 命令发 AddPlayer 包，造一个只有你自己看得到的假人来预览皮肤，不占服务器实体。
+
+
+皮肤怎么放
+----------
+皮肤都放在 plugins/skin/skins/ 目录里，两种摆法：
+
+1) 普通皮肤(2D)
+   直接丢一张 png 进去就行：
+     skins/小明.png
+   皮肤名就是文件名(不带 .png)，比如上面这个皮肤名是 "小明"。
+   贴图按标准人物模型走(64x64 或 64x32 都行)。
+
+2) 4D 皮肤(带自定义模型)
+   建一个文件夹，名字就是皮肤名，里面放：
+     skins/龙娘/        <- 皮肤名是 "龙娘"
+       texture.png      <- 贴图(名字随意，认 .png)
+       geometry.json    <- 模型文件(名字随意，认 .json)
+   png 和 json 各放一个就够了，插件会自动认。
+
+   geometry.json 就是基岩版的几何模型文件，新老格式都支持：
+     - 新格式：里面有 "minecraft:geometry"，会自动读 description.identifier
+     - 老格式：键名形如 "geometry.xxx"，会自动识别
+   模型和贴图都是直接打进数据包发给客户端的，客户端不需要再装资源包。
+
+   注意：4D 皮肤的贴图尺寸要跟模型对得上(模型里 texture_width / texture_height
+   是多少，png 就得是多大)，不然会显示错乱。
+
+
+给别的插件用的接口(ll.exports，命名空间 SkinAPI)
+------------------------------------------------
+别的插件用 ll.imports("SkinAPI", "函数名") 拿到函数再调。
+
+  setSkin(player, skinName)        -> bool   套皮肤并记录(玩家退进自动补)
+  applySkin(player, skinName)      -> bool   只发包套皮肤，不写记录(临时)
+  clearSkin(player)                -> bool   清掉记录，玩家重进恢复原皮
+  showSkin(player, skinName)       -> bool   在该玩家面前展示假人皮肤(只他自己可见)
+  setSkinByMemory(player, skinName)-> string 内存改皮肤，成功返回 ""，失败返回错误说明
+  listSkins()                      -> 数组   列出可用皮肤名
+  reload()                         -> bool   重新扫描皮肤目录
+
+skinName 就是 skins/ 目录里的皮肤名(png 文件名或 4D 文件夹名)。
+
+例子：
+  const setSkin = ll.imports("SkinAPI", "setSkin");
+  setSkin(player, "龙娘");
