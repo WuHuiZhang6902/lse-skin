@@ -8,7 +8,7 @@
  *  - /skin show 用 GMLIB 在面前展示假人皮肤
  *  - /skin mem  实验性：用 ila-lseexport 直接改服务器内存里的皮肤
  *
- * @author 子沐呀 QQ 1756150362
+ * @author 干物社 QQ 2063665699、子沐呀 QQ 1756150362
  */
 
 const PLUGIN_DIR = "./plugins/skin";
