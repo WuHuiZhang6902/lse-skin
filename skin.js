@@ -6,7 +6,7 @@
  *  - 支持普通皮肤(单张 png)和 4D 皮肤(png + 自定义几何 json)
  *  - 设置会记下来，玩家重进自动补发
  *  - /skin show 用 GMLIB 在面前展示假人皮肤
- *  - /skin mem  实验性：用 ila-lseexport 直接改服务器内存里的皮肤
+ *  - 换肤/展示全程发包(GMLIB 二进制流)；/clear 可选用 ila 读内存原皮即时还原(默认关，见 ENABLE_MEM_RESTORE)
  *
  * @author 干物社 QQ 2063665699、子沐呀 QQ 1756150362
  */
@@ -16,9 +16,11 @@ const SKINS_DIR = PLUGIN_DIR + "/skins/";
 const DATA_PATH = PLUGIN_DIR + "/players.json";
 // URL 皮肤下载下来的图缓存在这，文件名按 URL 算个 hash，同一个链接复用不重复下
 const URL_CACHE_DIR = SKINS_DIR + ".urlcache/";
+// clear 时若存在这个皮肤(skins/default.png 或文件夹)，就发包套上当"恢复默认"，否则只能等玩家重进
+const DEFAULT_SKIN_NAME = "default";
 
 let UPNG = null;
-try { UPNG = require("./skin/UPNG.js"); } catch (e) { logger.error("[skin] 加载 UPNG 失败: " + e); }
+try { UPNG = require("./skin/UPNG.js"); } catch (e) { logger.error("加载 UPNG 失败: " + e); }
 
 try { if (!File.exists(SKINS_DIR)) File.mkdir(SKINS_DIR); } catch (e) {}
 try { if (!File.exists(URL_CACHE_DIR)) File.mkdir(URL_CACHE_DIR); } catch (e) {}
@@ -73,7 +75,7 @@ function decodePng(path) {
         let img = UPNG.decode(content);
         return { width: img.width, height: img.height, data: UPNG.toRGBA8(img)[0] };
     } catch (e) {
-        logger.warn("[skin] 解析 PNG 失败: " + path + " (" + e + ")");
+        logger.warn("解析 PNG 失败: " + path + " (" + e + ")");
         return null;
     }
 }
@@ -142,7 +144,7 @@ function loadSkin(name) {
         if (g) { geometryName = g.name; geometryData = g.data; geometryEngineVersion = g.engineVersion || "0.0.0"; break; }
     }
     if (jsonPaths.length && geometryData === "") {
-        logger.warn("[skin] " + name + " 目录里没找到能识别的 geometry，按普通皮肤处理");
+        logger.warn("" + name + " 目录里没找到能识别的 geometry，按普通皮肤处理");
     }
 
     let result = {
@@ -172,6 +174,14 @@ function urlCacheName(url) {
     return "u" + h.toString(16) + ".png";
 }
 function urlCachePath(url) { return URL_CACHE_DIR + urlCacheName(url); }
+
+// 套上 URL 皮肤后把下载的缓存图删掉(皮肤已解码进内存 skinCache，本会话再用不到那个文件了，省磁盘)
+function cleanupUrlCache(url) {
+    try {
+        let p = urlCachePath(url);
+        if (File.exists(p)) File.delete(p);
+    } catch (e) {}
+}
 
 // 确保 URL 的图已经在本地缓存：在就直接回调，不在就用 curl 下一份。cb(ok, err)
 let urlInflight = {};
@@ -231,7 +241,7 @@ let GMLIB = null;
 function getGMLIB() {
     if (GMLIB) return GMLIB;
     try { GMLIB = require("./GMLIB-LegacyRemoteCallApi/lib/GMLIB_API-JS.js"); }
-    catch (e) { logger.error("[skin] 加载 GMLIB 失败，皮肤发包用不了: " + e); GMLIB = null; }
+    catch (e) { logger.error("加载 GMLIB 失败，皮肤发包用不了: " + e); GMLIB = null; }
     return GMLIB;
 }
 
@@ -328,6 +338,363 @@ function sendOne(G, target, fill) {
 }
 
 
+// ==================== 内存读「真实皮肤」(可选，默认关) ====================
+// 发包换肤只改客户端、不动服务器内存，所以服务器里存的一直是玩家上传的「原皮」。
+// 这里用 ila 把原皮序列化成字节，/clear 时直接发回去 => 瞬间还原原皮，不用提前存盘。
+//
+// !! 风险 !! 全是裸内存操作，偏移/符号错了会硬崩(0xC0000005/0xC0000409)，JS 的 try/catch
+//    拦不住这种崩溃。所以默认关着，先在测试服把开关打开验证没问题，再上线。
+// 内存读原皮：getLevel→getPlayerList→定位玩家→SerializedSkinImpl::write 序列化原皮，
+// 再用 getString(addr,true) 以 base64 无损读出字节(ila 新增 base64 参数)，发包还原。
+const ENABLE_MEM_RESTORE = true;
+
+// 符号(MCAPI 真符号，已在本服 /skin symtest 验证可解析)。
+const SYM = {
+    // ll::service::getLevel() -> optional_ref<Level>  (在 LeviLamina.dll)
+    getLevel: "?getLevel@bedrock@service@ll@@YA?AV?$optional_ref@VLevel@@@@XZ",
+    // Level::getPlayerList() const -> unordered_map<UUID,PlayerListEntry> const&  (本服按虚函数 U 收录)
+    getPlayerList: "?getPlayerList@Level@@QEBAAEBV?$unordered_map@VUUID@mce@@VPlayerListEntry@@U?$hash@VUUID@mce@@@std@@U?$equal_to@VUUID@mce@@@5@V?$allocator@U?$pair@$$CBVUUID@mce@@VPlayerListEntry@@@std@@@5@@std@@XZ",
+    // SerializedSkinImpl::write(BinaryStream&) const -> void  (把皮肤序列化成线格式字节)
+    skinImplWrite: "?write@SerializedSkinImpl@@QEBAXAEAVBinaryStream@@@Z",
+    // BinaryStream::BinaryStream(std::string& buf, bool copyBuffer)  (让 C++ 自己设 vptr，省掉虚表)
+    bsCtor: "??0BinaryStream@@QEAA@AEAV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@_N@Z"
+};
+// ila 的符号表里同名符号可能带 _0/_1 去重后缀，const 成员有时按虚函数(U)收录，
+// 不同发行也可能挂在不同模块名下。挨个试，命中合法地址就用。
+const SYM_MODULES = ["", "bedrock_server.exe", "bedrock_server.dll", "LeviLamina.dll"];
+function symCandidates(sym) {
+    let list = [sym, sym + "_0", sym + "_1"];
+    if (sym.indexOf("QEBA") >= 0) list.push(sym.replace("QEBA", "UEBA"), sym.replace("QEBA", "UEBA") + "_0");
+    return list;
+}
+
+// std::string MSVC 布局: data/SSO +0x00(16B), size +0x10, cap +0x18
+const STR = { size: 0x20, dataOff: 0x00, sizeOff: 0x10, capOff: 0x18 };
+// std::unordered_map(MSVC，本服已验证): 链表头指针 @+0x08, 元素数 @+0x10
+//   链表结点: next @+0x00, value(pair) @+0x10
+//   pair<const UUID, PlayerListEntry>: UUID 16B @+0x00, PlayerListEntry @+0x10
+//   PlayerListEntry: mXUID(std::string) @+0x38, mSkin(SerializedSkinRef) @+0x80
+const MAP = { listHead: 0x08, count: 0x10, nodeNext: 0x00, nodeValue: 0x10, entryOff: 0x10, xuidOff: 0x38, skinOff: 0x80 };
+
+let ila = null;
+let ilaTried = false;
+function getIla() {
+    if (ilaTried) return ila;
+    ilaTried = true;
+    try { ila = require("./iListenAttentively-LseExport/lib/iListenAttentively.js"); }
+    catch (e) { ila = null; }
+    return ila;
+}
+
+// 符号地址缓存，少调底层(性能)
+const symCache = {};
+let memWarned = false;
+function memWarn(msg) { if (!memWarned) { memWarned = true; logger.warn("内存功能不可用，已回退: " + msg); } }
+
+function looksLikePtr(p) { return typeof p === "number" && p > 0x10000 && p < 0x7FFFFFFFFFFF; }
+
+function symAddr(I, key) {
+    if (symCache[key] !== undefined) return symCache[key];
+    let addr = 0;
+    let cands = symCandidates(SYM[key]);
+    outer:
+    for (let m = 0; m < SYM_MODULES.length; m++) {
+        for (let c = 0; c < cands.length; c++) {
+            let got = 0;
+            try {
+                got = SYM_MODULES[m]
+                    ? I.getAddressFromSymbol(SYM_MODULES[m], cands[c])
+                    : I.getAddressFromSymbol(cands[c]);
+            } catch (e) { got = 0; }
+            if (looksLikePtr(got)) { addr = got; break outer; }
+        }
+    }
+    symCache[key] = addr;
+    return addr;
+}
+
+const NT = (function () { let I = getIla(); return I ? I.NativeType : null; })();
+
+// 读一个 std::string 对象(在 strAddr)的字节，失败返回 null
+function readStdBytes(I, strAddr, max) {
+    let size = I.getUnsignedLongLong(strAddr + STR.sizeOff) || 0;
+    let cap = I.getUnsignedLongLong(strAddr + STR.capOff) || 0;
+    if (size <= 0 || size > (max || 300000)) return null;
+    let dataAddr = (cap <= 15) ? (strAddr + STR.dataOff) : I.getRawAddress(strAddr + STR.dataOff);
+    if (!looksLikePtr(dataAddr)) return null;
+    let out = new Array(size);
+    for (let i = 0; i < size; i++) out[i] = (I.getUnsignedChar(dataAddr + i) || 0) & 0xFF;
+    return out;
+}
+function readStdStr(I, strAddr) {
+    let b = readStdBytes(I, strAddr, 256);
+    if (!b) return "";
+    let s = "";
+    for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    return s;
+}
+
+// base64 -> 字节数组(纯 JS，无损)。用于把 getString(addr,true) 读出的 base64 还原成原始字节。
+let _b64lut = null;
+function b64ToBytes(s) {
+    if (typeof s !== "string" || !s) return null;
+    s = s.replace(/[^A-Za-z0-9+/=]/g, "");
+    if (!_b64lut) {
+        _b64lut = new Int16Array(128).fill(-1);
+        let tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (let i = 0; i < tab.length; i++) _b64lut[tab.charCodeAt(i)] = i;
+    }
+    let len = s.length;
+    let pad = 0;
+    if (len >= 1 && s.charCodeAt(len - 1) === 61) pad++;
+    if (len >= 2 && s.charCodeAt(len - 2) === 61) pad++;
+    let outLen = ((len >> 2) * 3) - pad;
+    if (outLen <= 0) return null;
+    let out = new Uint8Array(outLen);
+    let oi = 0;
+    for (let i = 0; i < len; i += 4) {
+        let a = _b64lut[s.charCodeAt(i)] || 0;
+        let b = _b64lut[s.charCodeAt(i + 1)] || 0;
+        let c = _b64lut[s.charCodeAt(i + 2)] & 63;
+        let d = _b64lut[s.charCodeAt(i + 3)] & 63;
+        let n = (a << 18) | (b << 12) | (c << 6) | d;
+        if (oi < outLen) out[oi++] = (n >> 16) & 0xFF;
+        if (oi < outLen) out[oi++] = (n >> 8) & 0xFF;
+        if (oi < outLen) out[oi++] = n & 0xFF;
+    }
+    return out;
+}
+
+// 用 BinaryStream(std::string& buf, false) 构造一个真流，让 C++ 自己写 vptr。
+// 写出来的字节落进我们传进去的 buf。返回 { bs, buf } 两个地址，失败返回 null。
+function makeStream(I) {
+    let ctor = symAddr(I, "bsCtor");
+    if (!looksLikePtr(ctor)) { logger.warn("makeStream: bsCtor 符号没解析出来"); return null; }
+    let buf = 0, bs = 0;
+    try {
+        buf = I.mallocMemory(STR.size) || 0;
+        bs = I.mallocMemory(0x60) || 0;
+        if (!looksLikePtr(buf) || !looksLikePtr(bs)) throw new Error("malloc 返回非法地址");
+        I.memsetMemory(buf, 0, STR.size); // 全 0 = 合法空 std::string
+        I.memsetMemory(bs, 0, 0x60);
+        // this=bs, arg1=std::string& buf, arg2=copyBuffer=false。
+        // bool 参数 ila 的接受形式不确定，挨个试编码，参数校验是在真正调用前做的，失败不会动到内存。
+        let attempts = [
+            { t: [NT.Pointer, NT.Pointer, NT.Bool], v: [bs, buf, false] },
+            { t: [NT.Pointer, NT.Pointer, NT.Bool], v: [bs, buf, 0] },
+            { t: [NT.Pointer, NT.Pointer, NT.UnsignedChar], v: [bs, buf, 0] },
+            { t: [NT.Pointer, NT.Pointer, NT.Int], v: [bs, buf, 0] }
+        ];
+        let ok = false, lastErr = null;
+        for (let a = 0; a < attempts.length; a++) {
+            try { I.dynamicCall(ctor, NT.Pointer, attempts[a].t, attempts[a].v); ok = true; break; }
+            catch (e) { lastErr = e; }
+        }
+        if (!ok) throw new Error("dynamicCall 全部编码失败: " + lastErr);
+        return { bs: bs, buf: buf };
+    } catch (e) {
+        if (bs) { try { I.freeMemory(bs); } catch (e2) {} }
+        if (buf) { try { I.freeMemory(buf); } catch (e2) {} }
+        return null;
+    }
+}
+
+// ll::service::getLevel() -> Level*  (optional_ref<Level> 经 sret 返回，读缓冲里的唯一 Level*)
+function memGetLevel(I) {
+    let addr = symAddr(I, "getLevel");
+    if (!looksLikePtr(addr)) return 0;
+    let ret = 0, lvl = 0;
+    try {
+        ret = I.mallocMemory(16) || 0;
+        if (!looksLikePtr(ret)) return 0;
+        I.memsetMemory(ret, 0, 16);
+        I.dynamicCall(addr, NT.Pointer, [NT.Pointer], [ret]);
+        lvl = I.getRawAddress(ret);
+    } catch (e) { lvl = 0; }
+    finally { if (ret) { try { I.freeMemory(ret); } catch (e) {} } }
+    return looksLikePtr(lvl) ? lvl : 0;
+}
+
+// Level::getPlayerList(this=level) -> map*
+function memGetPlayerList(I, level) {
+    let addr = symAddr(I, "getPlayerList");
+    if (!looksLikePtr(addr) || !looksLikePtr(level)) return 0;
+    let map = 0;
+    try { map = I.dynamicCall(addr, NT.Pointer, [NT.Pointer], [level]); } catch (e) { map = 0; }
+    return looksLikePtr(map) ? map : 0;
+}
+
+// 遍历玩家列表(unordered_map 的内部链表)，按 xuid 找到目标的 SerializedSkinImpl*(失败 0)
+let MEM_DEBUG = false;
+function memFindSkinImpl(I, mapPtr, xuid) {
+    let head = I.getRawAddress(mapPtr + MAP.listHead);
+    let count = I.getUnsignedLongLong(mapPtr + MAP.count) || 0;
+    if (MEM_DEBUG) logger.warn("mem: head=" + (head ? head.toString(16) : 0) + " count=" + count + " 目标xuid=" + xuid);
+    if (!looksLikePtr(head) || count <= 0 || count > 5000) return 0;
+    let node = I.getRawAddress(head + MAP.nodeNext); // sentinel.next = 第一个真实结点
+    let guard = 0;
+    while (looksLikePtr(node) && node !== head && guard <= count + 1) {
+        guard++;
+        let entry = node + MAP.nodeValue + MAP.entryOff;
+        let xs = readStdStr(I, entry + MAP.xuidOff);
+        if (MEM_DEBUG) logger.warn("mem: 结点#" + guard + " entry=" + entry.toString(16) + " xuid='" + xs + "'");
+        if (xs === xuid) {
+            // entry+0x80 = SerializedSkinRef(shared_ptr)，_Ptr 即 ThreadOwner* == SerializedSkinImpl*
+            let impl = I.getRawAddress(entry + MAP.skinOff);
+            if (MEM_DEBUG) logger.warn("mem: 命中! impl=" + (impl ? impl.toString(16) : 0));
+            return looksLikePtr(impl) ? impl : 0;
+        }
+        node = I.getRawAddress(node + MAP.nodeNext);
+    }
+    if (MEM_DEBUG) logger.warn("mem: 遍历完没匹配到 xuid");
+    return 0;
+}
+
+// 诊断：把一堆候选符号挨个丢给 ila，看哪个能解析出合法地址，结果打日志。
+// 用 /skin symtest 触发，把输出贴回来就能确定该用哪条符号路径。
+function runSymTest(logFn) {
+    let I = getIla();
+    if (!I) { logFn("§c没装/没加载 iListenAttentively-LseExport"); return; }
+    let probes = {
+        "writeRawBytes#a": "?writeRawBytes@BinaryStream@@QEAAXVbuffer_span@@PEBD1@Z",
+        "writeRawBytes#b": "?writeRawBytes@BinaryStream@@QEAAXVbuffer_span@@PEBD0@Z",
+        "writeRawBytes#c": "?writeRawBytes@BinaryStream@@QEAAX?$buffer_span@$$CBD@@PEBD1@Z",
+        "BinaryStream::ctor(string&,bool)": "??0BinaryStream@@QEAA@AEAV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@_N@Z"
+    };
+    for (let label in probes) {
+        if (!Object.prototype.hasOwnProperty.call(probes, label)) continue;
+        let base = probes[label];
+        let cands = symCandidates(base);
+        let hit = null;
+        outer:
+        for (let m = 0; m < SYM_MODULES.length; m++) {
+            for (let c = 0; c < cands.length; c++) {
+                let got = 0;
+                try {
+                    got = SYM_MODULES[m] ? I.getAddressFromSymbol(SYM_MODULES[m], cands[c]) : I.getAddressFromSymbol(cands[c]);
+                } catch (e) { got = 0; }
+                if (looksLikePtr(got)) { hit = { mod: SYM_MODULES[m] || "(default)", sym: cands[c], addr: got }; break outer; }
+            }
+        }
+        if (hit) logFn("§a[OK] " + label + " -> " + hit.addr.toString(16) + "  @" + hit.mod + "  " + hit.sym);
+        else logFn("§c[FAIL] " + label);
+    }
+
+    // 探测 GMLIB 流句柄是不是底层 BinaryStream* 指针：建流、写一个包头(1字节)，扫描偏移找 size==1
+    try {
+        let G = getGMLIB();
+        if (G) {
+            let s = new G.GMLIB_BinaryStream();
+            s.writePacketHeader(93);
+            let id = s.getId();
+            logFn("§eGMLIB id=" + (typeof id === "number" ? id.toString(16) : id) + " looksLikePtr=" + looksLikePtr(id));
+            if (looksLikePtr(id)) {
+                for (let off = 0; off <= 0x40; off += 8) {
+                    let v = 0; try { v = I.getUnsignedLongLong(id + off) || 0; } catch (e) { v = -1; }
+                    logFn("§7  +0x" + off.toString(16) + " = " + (v === -1 ? "ERR" : v.toString(16)));
+                }
+            }
+            try { s.destroy(); } catch (e) {}
+        }
+    } catch (e) { logFn("§cGMLIB 探测异常: " + e); }
+}
+
+// 读玩家当前「真实皮肤」的线格式字节(失败返回 null)。注意：开关关着时永不进内存。
+function readRealSkinBytes(player) {
+    if (!ENABLE_MEM_RESTORE) return null;
+    let I = getIla();
+    if (!I || !NT) { memWarn("没装 iListenAttentively-LseExport"); return null; }
+
+    let writeAddr = symAddr(I, "skinImplWrite");
+    if (!looksLikePtr(writeAddr)) { memWarn("符号解析失败(SerializedSkinImpl::write)"); return null; }
+    if (!player || !player.xuid) return null;
+
+    let stream = null;
+    try {
+        let level = memGetLevel(I);
+        if (MEM_DEBUG) logger.warn("mem: level=" + (level ? level.toString(16) : 0));
+        if (!level) { memWarn("getLevel 失败"); return null; }
+        let map = memGetPlayerList(I, level);
+        if (MEM_DEBUG) logger.warn("mem: map=" + (map ? map.toString(16) : 0));
+        if (!map) { memWarn("getPlayerList 失败"); return null; }
+        let impl = memFindSkinImpl(I, map, player.xuid);
+        if (!impl) return null; // 没在列表里找到该玩家，或皮肤指针为空
+
+        stream = makeStream(I);
+        if (!stream) { memWarn("构造 BinaryStream 失败"); return null; }
+
+        // SerializedSkinImpl::write(this=impl, &bs) -> 序列化原皮(字节落在外部 buf，copyBuffer=false)
+        I.dynamicCall(writeAddr, NT.Void, [NT.Pointer, NT.Pointer], [impl, stream.bs]);
+
+        // 一次调用以 base64 无损读出整个 std::string(getString 第二参 base64=true)，再纯 JS 解码成字节
+        let size = I.getUnsignedLongLong(stream.buf + STR.sizeOff) || 0;
+        if (size <= 0 || size > 4000000) { if (MEM_DEBUG) logger.warn("mem: size 异常=" + size); return null; }
+        let b64 = I.getString(stream.buf, true);
+        let bytes = b64ToBytes(b64);
+        if (MEM_DEBUG) logger.warn("mem: size=" + size + " b64.len=" + (b64 ? b64.length : "null") + " 解码字节数=" + (bytes ? bytes.length : "null"));
+        if (!bytes || bytes.length !== size) { if (MEM_DEBUG) logger.warn("mem: 解码字节数与 size 不符，放弃发包"); return null; }
+        return bytes;
+    } catch (e) {
+        memWarn("" + e);
+        return null;
+    } finally {
+        // 只释放自己 malloc 的结构块；std::string 内部若扩到堆(原皮几十 KB)那块是 MC 分配的，
+        // 用 ila 的 free 跨堆释放会崩，宁可小泄漏(clear 很少触发)。
+        if (stream) {
+            if (stream.bs) { try { I.freeMemory(stream.bs); } catch (e) {} }
+            if (stream.buf) { try { I.freeMemory(stream.buf); } catch (e) {} }
+        }
+    }
+}
+
+// 往 GMLIB 流里塞一段原始皮肤字节(就是 writeSkinStruct 的位置，只是改成现成的字节)
+function writeRawSkin(bs, raw) {
+    for (let i = 0; i < raw.length; i++) bs.writeUnsignedChar(raw[i] & 0xFF);
+}
+function fillPlayerSkinRaw(bs, player, raw) {
+    bs.writePacketHeader(PKT_PLAYER_SKIN);
+    bs.writeUuid(player.uuid);
+    writeRawSkin(bs, raw);
+    bs.writeString("");
+    bs.writeString("");
+    bs.writeBool(true);
+}
+function fillListAddRaw(bs, player, raw) {
+    bs.writePacketHeader(PKT_PLAYER_LIST);
+    bs.writeByte(0);
+    bs.writeUnsignedVarInt(1);
+    bs.writeUuid(player.uuid);
+    bs.writeVarInt64(Number(player.uniqueId));
+    bs.writeString(player.realName || player.name || "");
+    bs.writeString(player.xuid || "");
+    bs.writeString("");
+    bs.writeSignedInt(-1);
+    writeRawSkin(bs, raw);
+    bs.writeBool(false);
+    bs.writeBool(false);
+    bs.writeBool(false);
+    bs.writeUnsignedInt(0xFFFFFFFF);
+    bs.writeBool(true);
+}
+
+// 读内存里的原皮 -> 发包还原(在线即时 + 玩家列表)。成功返回 true。
+function restoreRealSkin(player) {
+    let raw = readRealSkinBytes(player);
+    if (!raw) return false;
+    let G = getGMLIB();
+    if (!G) return false;
+    try {
+        sendAll(G, function (bs) { fillPlayerSkinRaw(bs, player, raw); });
+        sendAll(G, function (bs) { fillListRemove(bs, player); });
+        sendAll(G, function (bs) { fillListAddRaw(bs, player, raw); });
+    } catch (e) {
+        logger.error("还原原皮发包失败: " + e);
+        return false;
+    }
+    return true;
+}
+
+
 // ==================== 套皮肤(发包) ====================
 // 给在线玩家发 PlayerSkin 立即刷新，再走一遍 PlayerList(移除+添加)把列表里的皮肤也改掉。
 // 在线的人马上看到新皮肤，新玩家进服也能从玩家列表拿到正确皮肤
@@ -335,13 +702,13 @@ function applySkin(target, skinName) {
     let skin = loadSkin(skinName);
     if (!skin) return false;
     let G = getGMLIB();
-    if (!G) { logger.error("[skin] 没装 GMLIB，发不了皮肤包"); return false; }
+    if (!G) { logger.error("没装 GMLIB，发不了皮肤包"); return false; }
     try {
         sendAll(G, function (bs) { fillPlayerSkin(bs, target, skin); });
         sendAll(G, function (bs) { fillListRemove(bs, target); });
         sendAll(G, function (bs) { fillListAdd(bs, target, skin); });
     } catch (e) {
-        logger.error("[skin] 发皮肤包失败: " + e);
+        logger.error("发皮肤包失败: " + e);
         return false;
     }
     return true;
@@ -505,7 +872,7 @@ function showSkin(player, skinName) {
         ap.writeSignedInt(-1);        // Build Platform
         ap.sendTo(player);
     } catch (e) {
-        logger.error("[skin] 展示皮肤失败: " + e);
+        logger.error("展示皮肤失败: " + e);
         return false;
     }
 
@@ -524,195 +891,6 @@ mc.listen("onLeft", function (pl) {
 });
 
 
-// ==================== 内存改皮肤(实验性) ====================
-// 思路：玩家 -> Actor::getLevel -> Level::getPlayerList(unordered_map)
-//       按 UUID 找到 PlayerListEntry -> 偏移到 mSkin(SerializedSkin*)
-//       把序列化好的皮肤字节塞进手搓的 ReadOnlyBinaryStream，调 SerializedSkin::read 原地换皮
-// 全程用 ila-lseexport 的符号调用 + 内存读写，跨版本只改下面 SYM/OFF。
-// !!! SYM/OFF 必须用 ShrBox 核对后填好，否则不运行；偏移填错会崩服，先在测试服验证 !!!
-let ila = null, ilaTried = false;
-function getIla() {
-    if (ilaTried) return ila;
-    ilaTried = true;
-    try { ila = require("plugins/iListenAttentively-LseExport/lib/iListenAttentively.js"); }
-    catch (e) { logger.error("[skin] 加载 iListenAttentively 失败: " + e); ila = null; }
-    return ila;
-}
-
-const MEM_SYM = {
-    // ll::service::bedrock::getLevel() -> optional_ref<Level>(里面就一个 Level*，直接当 Level* 用)，自由函数无 this
-    getLevel: "?getLevel@bedrock@service@ll@@YA?AV?$optional_ref@VLevel@@@@XZ_0",
-    // Level::getPlayerList() -> unordered_map<mce::UUID, PlayerListEntry> const&
-    getPlayerList: "?getPlayerList@Level@@QEBAAEBV?$unordered_map@VUUID@mce@@VPlayerListEntry@@U?$hash@VUUID@mce@@@std@@U?$equal_to@VUUID@mce@@@5@V?$allocator@U?$pair@$$CBVUUID@mce@@VPlayerListEntry@@@std@@@5@@std@@XZ",
-    // SerializedSkinImpl::read(ReadOnlyBinaryStream&) -> Bedrock::Result<void>(返回值走 sret)
-    serializedSkinRead: "?read@SerializedSkinImpl@@QEAA?AV?$Result@XVerror_code@std@@@Bedrock@@AEAVReadOnlyBinaryStream@@@Z"
-};
-const MEM_OFF = {
-    mapListHead: 0x00,     // MSVC unordered_map 首地址就是内部 std::list 的 _Myhead(哨兵指针)
-    listNodeValue: 0x10,   // list 节点 _Next(8)+_Prev(8) 之后才是 value
-    pairKeyUuid: 0x00,     // pair<const mce::UUID, PlayerListEntry>：UUID 在前 16 字节(两个小端 uint64: a,b)
-    pairValueEntry: 0x10,
-    entryMSkin: 0x80,      // PlayerListEntry.mSkin，里面是 shared_ptr，*(entry+0x80) 直接就是 SerializedSkinImpl*
-    robsSize: 0x40,        // 手搓 ReadOnlyBinaryStream 的内存大小
-    robsViewData: 0x20,    // string_view.data
-    robsViewSize: 0x28,    // string_view.size
-    robsReadPtr: 0x38,     // mReadPointer
-    resultSize: 0x20       // Bedrock::Result<void> 的 sret 返回缓冲(给宽点够用)
-};
-
-// 三个符号没填齐就别动内存，免得瞎跑崩服
-function memSymbolsReady() {
-    return MEM_SYM.getLevel && MEM_SYM.getPlayerList && MEM_SYM.serializedSkinRead;
-}
-
-// 一个写进 JS 字节数组的“流”，方法名跟原生 BinaryStream 对齐，直接复用 writeSkinStruct
-function byteStream() {
-    let buf = [];
-    return {
-        buf: buf,
-        writeUnsignedVarInt: function (v) {
-            v = v >>> 0;
-            while (v >= 0x80) { buf.push((v & 0x7F) | 0x80); v >>>= 7; }
-            buf.push(v);
-        },
-        writeUnsignedInt: function (v) {
-            v = v >>> 0;
-            buf.push(v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, (v >>> 24) & 0xFF);
-        },
-        writeUnsignedChar: function (v) { buf.push(v & 0xFF); },
-        writeBool: function (b) { buf.push(b ? 1 : 0); },
-        writeString: function (s) {
-            s = s || "";
-            let tmp = [];
-            for (let i = 0; i < s.length; i++) {
-                let c = s.charCodeAt(i);
-                if (c < 0x80) tmp.push(c);
-                else if (c < 0x800) tmp.push(0xC0 | (c >> 6), 0x80 | (c & 0x3F));
-                else tmp.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F));
-            }
-            this.writeUnsignedVarInt(tmp.length);
-            for (let i = 0; i < tmp.length; i++) buf.push(tmp[i]);
-        }
-    };
-}
-
-function serializeSkinBytes(skin) {
-    let s = byteStream();
-    writeSkinStruct(s, skin);
-    // 注意：完整 SerializedSkin::read 末尾可能还有 TrustedSkinFlag(enum)，
-    // 如果 read 解析越界，就在这里补一个字节：s.buf.push(1);
-    return s.buf;
-}
-
-// ll::service::bedrock::getLevel()，自由函数无 this，返回值就是 Level*
-function memGetLevel(I) {
-    let addr = I.getAddressFromSymbol(MEM_SYM.getLevel);
-    if (!addr) { logger.error("[skin] 找不到符号: getLevel"); return 0; }
-    return I.dynamicCall(addr, I.NativeType.Pointer, [], []) || 0;
-}
-
-// Level::getPlayerList()，this = Level，返回 unordered_map 地址
-function memGetPlayerList(I, level) {
-    let addr = I.getAddressFromSymbol(MEM_SYM.getPlayerList);
-    if (!addr) { logger.error("[skin] 找不到符号: getPlayerList"); return 0; }
-    return I.dynamicCall(addr, I.NativeType.Pointer, [I.NativeType.Pointer], [level]) || 0;
-}
-
-// 把 uuid 字符串转成 mce::UUID 在内存里的 16 字节(两个小端 uint64: 前半=a，后半=b)
-function uuidToMemBytes(uuid) {
-    let hex = uuid.replace(/-/g, "");
-    function le8(h) {
-        let b = [];
-        for (let i = 0; i < 8; i++) b.push(parseInt(h.substr(i * 2, 2), 16));
-        b.reverse(); // 小端
-        return b;
-    }
-    return le8(hex.slice(0, 16)).concat(le8(hex.slice(16, 32)));
-}
-
-// 在 map 里按 UUID 找到 PlayerListEntry 首地址。64 位读会丢精度，所以逐字节比
-function memFindEntry(I, mapPtr, uuidBytes) {
-    let head = I.getUnsignedLongLong(mapPtr + MEM_OFF.mapListHead);
-    if (!head) return 0;
-    let node = I.getUnsignedLongLong(head);
-    let guard = 0;
-    while (node && node !== head && guard < 100000) {
-        guard++;
-        let value = node + MEM_OFF.listNodeValue;
-        let match = true;
-        for (let i = 0; i < 16; i++) {
-            if ((I.getUnsignedChar(value + MEM_OFF.pairKeyUuid + i) & 0xFF) !== uuidBytes[i]) { match = false; break; }
-        }
-        if (match) return value + MEM_OFF.pairValueEntry;
-        node = I.getUnsignedLongLong(node);
-    }
-    return 0;
-}
-
-// 把 skin 写进某玩家服务器端的 mSkin。成功返回 null，失败返回错误说明
-function applySkinByRead(player, skin) {
-    let I = getIla();
-    if (!I) return "iListenAttentively 没装/没加载";
-    if (!memSymbolsReady()) return "skin.js 里的 MEM_SYM 还没填(用 ShrBox 核对)";
-
-    let level = memGetLevel(I);
-    if (!level) return "getLevel 失败";
-    let map = memGetPlayerList(I, level);
-    if (!map) return "getPlayerList 失败";
-
-    let entry = memFindEntry(I, map, uuidToMemBytes(player.uuid));
-    if (!entry) return "玩家列表里没找到这个 UUID";
-
-    // *(entry+0x80) 直接是 SerializedSkinImpl*，当 read 的 this
-    let skinPtr = I.getUnsignedLongLong(entry + MEM_OFF.entryMSkin);
-    if (!skinPtr) return "取 SerializedSkinImpl 指针失败";
-
-    let readAddr = I.getAddressFromSymbol(MEM_SYM.serializedSkinRead);
-    if (!readAddr) return "找不到 SerializedSkinImpl::read 符号";
-
-    let bytes = serializeSkinBytes(skin);
-    let dataAddr = I.mallocMemory(bytes.length);
-    if (!dataAddr) return "分配皮肤内存失败";
-    let robs = 0, ret = 0;
-    try {
-        for (let i = 0; i < bytes.length; i++) I.setUnsignedChar(dataAddr + i, bytes[i] & 0xFF);
-
-        // 手搓一个 ReadOnlyBinaryStream：清零(空 owned string + 各种 0)，再把 string_view 指向皮肤字节
-        robs = I.mallocMemory(MEM_OFF.robsSize);
-        if (!robs) return "分配流内存失败";
-        I.memsetMemory(robs, 0, MEM_OFF.robsSize);
-        I.setUnsignedLongLong(robs + MEM_OFF.robsViewData, dataAddr);
-        I.setUnsignedLongLong(robs + MEM_OFF.robsViewSize, bytes.length);
-        I.setUnsignedLongLong(robs + MEM_OFF.robsReadPtr, 0);
-
-        // read 返回 Bedrock::Result<void>(>8字节)，MSVC 走 sret：第一个参数是隐藏返回指针
-        ret = I.mallocMemory(MEM_OFF.resultSize);
-        if (!ret) return "分配返回缓冲失败";
-        I.memsetMemory(ret, 0, MEM_OFF.resultSize);
-        I.dynamicCall(readAddr, I.NativeType.Pointer,
-            [I.NativeType.Pointer, I.NativeType.Pointer, I.NativeType.Pointer],
-            [ret, skinPtr, robs]);
-    } catch (e) {
-        return "read 调用异常: " + e;
-    } finally {
-        try { if (ret) I.freeMemory(ret); } catch (e) {}
-        try { if (robs) I.freeMemory(robs); } catch (e) {}
-        try { I.freeMemory(dataAddr); } catch (e) {}
-    }
-
-    // 服务器端皮肤已改，再给在线玩家发包刷新一下，让大家立刻看到
-    try {
-        let G = getGMLIB();
-        if (G) {
-            sendAll(G, function (bs) { fillPlayerSkin(bs, player, skin); });
-            sendAll(G, function (bs) { fillListRemove(bs, player); });
-            sendAll(G, function (bs) { fillListAdd(bs, player, skin); });
-        }
-    } catch (e) {}
-    return null;
-}
-
-
 // ==================== 命令 ====================
 mc.listen("onServerStarted", function () {
     let cmd = mc.newCommand("skin", "皮肤管理", PermType.GameMasters);
@@ -721,13 +899,13 @@ mc.listen("onServerStarted", function () {
     cmd.setEnum("ActList", ["list"]);
     cmd.setEnum("ActReload", ["reload"]);
     cmd.setEnum("ActShow", ["show"]);
-    cmd.setEnum("ActMem", ["mem"]);
+    cmd.setEnum("ActSymTest", ["symtest"]);
     cmd.mandatory("action", ParamType.Enum, "ActSet", 1);
     cmd.mandatory("action", ParamType.Enum, "ActClear", 1);
     cmd.mandatory("action", ParamType.Enum, "ActList", 1);
     cmd.mandatory("action", ParamType.Enum, "ActReload", 1);
     cmd.mandatory("action", ParamType.Enum, "ActShow", 1);
-    cmd.mandatory("action", ParamType.Enum, "ActMem", 1);
+    cmd.mandatory("action", ParamType.Enum, "ActSymTest", 1);
     cmd.mandatory("target", ParamType.Player);
     cmd.mandatory("skinName", ParamType.RawText);
     cmd.overload(["ActSet", "target", "skinName"]);
@@ -735,7 +913,7 @@ mc.listen("onServerStarted", function () {
     cmd.overload(["ActList"]);
     cmd.overload(["ActReload"]);
     cmd.overload(["ActShow", "skinName"]);
-    cmd.overload(["ActMem", "target", "skinName"]);
+    cmd.overload(["ActSymTest"]);
     cmd.setCallback(function (_c, _ori, out, res) {
         // 命令本身已是 GameMasters 权限，这里再兜一道：玩家执行的必须是 OP，后台(无 player)放行
         let executor = _ori.player;
@@ -764,7 +942,7 @@ mc.listen("onServerStarted", function () {
                     ensureUrlSkin(nameOrUrl, function (ok, err) {
                         if (!ok) {
                             if (executor) { try { executor.tell("§cURL 皮肤下载失败：" + err); } catch (e) {} }
-                            else logger.error("[skin] URL 皮肤下载失败：" + err);
+                            else logger.error("URL 皮肤下载失败：" + err);
                             return;
                         }
                         let n = 0;
@@ -773,8 +951,9 @@ mc.listen("onServerStarted", function () {
                             if (p && applySkin(p, nameOrUrl)) { playerData[xuids[i]] = nameOrUrl; n++; }
                         }
                         saveData();
+                        cleanupUrlCache(nameOrUrl);
                         let msg = "§a已给 " + n + " 个玩家设置 URL 皮肤";
-                        if (executor) { try { executor.tell(msg); } catch (e) {} } else logger.info("[skin] " + msg);
+                        if (executor) { try { executor.tell(msg); } catch (e) {} } else logger.info("" + msg);
                     });
                     return;
                 }
@@ -792,9 +971,19 @@ mc.listen("onServerStarted", function () {
             case "clear": {
                 let targets = res.target;
                 if (!targets || !targets.length) return out.error("§c没找到目标玩家");
-                for (let i = 0; i < targets.length; i++) delete playerData[targets[i].xuid];
+                // 优先：开了内存功能就读原皮直接发包还原(瞬间变回原皮)；
+                // 没开/读失败再退而求其次：有 skins/default 就套默认皮，否则等玩家重进。
+                let hasDefault = !!loadSkin(DEFAULT_SKIN_NAME);
+                let restored = 0, fellBack = 0;
+                for (let i = 0; i < targets.length; i++) {
+                    delete playerData[targets[i].xuid];
+                    if (restoreRealSkin(targets[i])) { restored++; continue; }
+                    if (hasDefault && applySkin(targets[i], DEFAULT_SKIN_NAME)) fellBack++;
+                }
                 saveData();
-                return out.success("§a已清除记录，对应玩家重新进服后恢复原皮肤");
+                if (restored > 0) return out.success("§a已清除，其中 " + restored + " 个发包还原了原皮，其余 " + fellBack + " 个套默认皮/等重进");
+                if (hasDefault) return out.success("§a已清除并发包恢复默认皮肤(" + fellBack + "/" + targets.length + ")");
+                return out.success("§a已清除记录，对应玩家重新进服后变回原皮肤(开启 ENABLE_MEM_RESTORE 可改成内存读原皮即时还原)");
             }
             case "show": {
                 let player = _ori.player;
@@ -806,25 +995,20 @@ mc.listen("onServerStarted", function () {
                 }
                 return out.error("§c展示失败，看后台日志");
             }
-            case "mem": {
-                let targets = res.target;
-                if (!targets || !targets.length) return out.error("§c没找到目标玩家");
-                let skin = loadSkin(res.skinName);
-                if (!skin) return out.error("§c没有这个皮肤：" + res.skinName);
-                let n = 0, lastErr = null;
-                for (let i = 0; i < targets.length; i++) {
-                    let err = applySkinByRead(targets[i], skin);
-                    if (err) lastErr = err; else n++;
-                }
-                if (n > 0) return out.success("§a内存改皮肤成功 " + n + " 个" + (lastErr ? "（部分失败：" + lastErr + "）" : ""));
-                return out.error("§c失败：" + (lastErr || "未知"));
+            case "symtest": {
+                let logFn = function (s) {
+                    if (executor) { try { executor.tell(s); } catch (e) {} }
+                    logger.info(s.replace(/§./g, ""));
+                };
+                runSymTest(logFn);
+                return out.success("§a符号测试完成，看聊天/后台日志，把结果贴回来");
             }
             default:
                 return out.error("§c未知操作");
         }
     });
     cmd.setup();
-    logger.info("[skin] /skin 命令已注册");
+    logger.info("/skin 命令已注册");
 });
 
 
@@ -839,6 +1023,7 @@ function api_setSkin(player, skinName) {
             if (!ok) return;
             let p = getOnlineByXuid(xuid);
             if (p && applySkin(p, skinName)) { playerData[xuid] = skinName; saveData(); }
+            cleanupUrlCache(skinName);
         });
         return true;
     }
@@ -856,16 +1041,14 @@ function api_clearSkin(player) {
     if (!player) return false;
     delete playerData[player.xuid];
     saveData();
+    // 优先内存读原皮即时还原；不行再套默认皮，再不行等玩家重进
+    if (restoreRealSkin(player)) return true;
+    if (loadSkin(DEFAULT_SKIN_NAME)) applySkin(player, DEFAULT_SKIN_NAME);
     return true;
 }
 function api_showSkin(player, skinName) {
     if (!player || !skinName || !loadSkin(skinName) || !getGMLIB()) return false;
     return showSkin(player, skinName);
-}
-function api_setSkinByMemory(player, skinName) {
-    let skin = loadSkin(skinName);
-    if (!player || !skin) return "参数错误或皮肤不存在";
-    return applySkinByRead(player, skin) || "";
 }
 function api_listSkins() { return listSkins(); }
 function api_reload() { clearSkinCache(); loadData(); return true; }
@@ -874,8 +1057,7 @@ ll.exports(api_setSkin, "SkinAPI", "setSkin");
 ll.exports(api_applySkin, "SkinAPI", "applySkin");
 ll.exports(api_clearSkin, "SkinAPI", "clearSkin");
 ll.exports(api_showSkin, "SkinAPI", "showSkin");
-ll.exports(api_setSkinByMemory, "SkinAPI", "setSkinByMemory");
 ll.exports(api_listSkins, "SkinAPI", "listSkins");
 ll.exports(api_reload, "SkinAPI", "reload");
 
-logger.info("[skin] 皮肤管理插件已加载");
+logger.info("皮肤管理插件已加载");

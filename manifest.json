@@ -4,7 +4,7 @@
     "type": "lse-quickjs",
     "version": "1.0.0",
     "author": "干物社、子沐呀",
-    "description": "皮肤管理插件，支持 2D/4D 皮肤、玩家换肤、内存改皮肤与对外接口",
+    "description": "皮肤管理插件，纯发包实现，支持 2D/4D 皮肤、玩家换肤、假人预览与对外接口",
     "dependencies": [
         {
             "name": "legacy-script-engine-quickjs"
