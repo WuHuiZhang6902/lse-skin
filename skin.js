@@ -14,11 +14,14 @@
 const PLUGIN_DIR = "./plugins/skin";
 const SKINS_DIR = PLUGIN_DIR + "/skins/";
 const DATA_PATH = PLUGIN_DIR + "/players.json";
+// URL 皮肤下载下来的图缓存在这，文件名按 URL 算个 hash，同一个链接复用不重复下
+const URL_CACHE_DIR = SKINS_DIR + ".urlcache/";
 
 let UPNG = null;
 try { UPNG = require("./skin/UPNG.js"); } catch (e) { logger.error("[skin] 加载 UPNG 失败: " + e); }
 
 try { if (!File.exists(SKINS_DIR)) File.mkdir(SKINS_DIR); } catch (e) {}
+try { if (!File.exists(URL_CACHE_DIR)) File.mkdir(URL_CACHE_DIR); } catch (e) {}
 
 
 // ==================== 持久化：xuid -> 皮肤名 ====================
@@ -65,8 +68,14 @@ function decodePng(path) {
     let f = new File(path, File.ReadMode, true);
     try { content = f.readAllSync(); } finally { try { f.close(); } catch (e) {} }
     if (!content) return null;
-    let img = UPNG.decode(content);
-    return { width: img.width, height: img.height, data: UPNG.toRGBA8(img)[0] };
+    // URL 下回来的可能不是 png(比如错误页)，解析失败别让它抛出去
+    try {
+        let img = UPNG.decode(content);
+        return { width: img.width, height: img.height, data: UPNG.toRGBA8(img)[0] };
+    } catch (e) {
+        logger.warn("[skin] 解析 PNG 失败: " + path + " (" + e + ")");
+        return null;
+    }
 }
 
 // 从几何 json 取几何名(default 引用的 identifier)和格式版本。
@@ -92,6 +101,18 @@ function parseGeometry(raw) {
 function loadSkin(name) {
     if (!name) return null;
     if (skinCache[name]) return skinCache[name];
+
+    // URL 皮肤：图已经下到 .urlcache/ 了，当普通 2D 皮肤读；没下好就返回 null，让调用方先去下
+    if (isUrl(name)) {
+        let img = decodePng(urlCachePath(name));
+        if (!img) return null;
+        let r = {
+            width: img.width, height: img.height, data: img.data,
+            geometryName: "geometry.humanoid.custom", geometryData: "", geometryEngineVersion: "0.0.0"
+        };
+        skinCache[name] = r;
+        return r;
+    }
 
     let texturePath = null;
     let jsonPaths = [];
@@ -131,6 +152,66 @@ function loadSkin(name) {
     };
     skinCache[name] = result;
     return result;
+}
+
+
+// ==================== URL 皮肤(下载到本地再当普通皮肤用) ====================
+function isUrl(s) { return typeof s === "string" && /^https?:\/\//i.test(s); }
+
+// 命令执行者是 OP/控制台，但 URL 还是要过滤掉能拆 shell 命令的字符，免得拼 curl 时出岔子
+function isSafeUrl(s) {
+    if (!isUrl(s)) return false;
+    if (s.length > 1024) return false;
+    return !/[\s"'`\\^<>|;]/.test(s);
+}
+
+// 按 URL 算个稳定 hash 当缓存文件名(djb2)，同一个链接每次都映射到同一个文件
+function urlCacheName(url) {
+    let h = 5381;
+    for (let i = 0; i < url.length; i++) h = (((h << 5) + h) ^ url.charCodeAt(i)) >>> 0;
+    return "u" + h.toString(16) + ".png";
+}
+function urlCachePath(url) { return URL_CACHE_DIR + urlCacheName(url); }
+
+// 确保 URL 的图已经在本地缓存：在就直接回调，不在就用 curl 下一份。cb(ok, err)
+let urlInflight = {};
+function ensureUrlSkin(url, cb) {
+    if (!isSafeUrl(url)) { cb(false, "URL 不合法或含特殊字符"); return; }
+    let dest = urlCachePath(url);
+    try {
+        if (File.exists(dest) && File.getFileSize(dest) > 0) { cb(true, ""); return; }
+    } catch (e) {}
+    if (urlInflight[url]) { urlInflight[url].push(cb); return; }
+    urlInflight[url] = [cb];
+    let finish = function (ok, err) {
+        let list = urlInflight[url] || [];
+        delete urlInflight[url];
+        delete skinCache[url];   // 重新解码新下的图
+        for (let i = 0; i < list.length; i++) { try { list[i](ok, err); } catch (e) {} }
+    };
+    // curl Win10+ / Linux 都自带，二进制下到文件最稳(走 network.httpGet 拿字符串会把 png 字节搞坏)
+    let command = 'curl -L -s -A "MC-Skin/1.0" --max-time 20 -o "' + dest + '" "' + url + '"';
+    let started = false;
+    try {
+        started = system.cmd(command, function (code, output) {
+            let ok = false;
+            try { ok = (File.exists(dest) && File.getFileSize(dest) > 0); } catch (e) {}
+            if (ok) finish(true, "");
+            else {
+                try { if (File.exists(dest)) File.delete(dest); } catch (e) {}
+                finish(false, "下载失败(curl code " + code + ")");
+            }
+        }, 25000);
+    } catch (e) { finish(false, "" + e); return; }
+    if (!started) finish(false, "无法启动下载进程(system.cmd)");
+}
+
+function getOnlineByXuid(xuid) {
+    let players = mc.getOnlinePlayers() || [];
+    for (let i = 0; i < players.length; i++) {
+        if (players[i] && players[i].xuid === xuid) return players[i];
+    }
+    return null;
 }
 
 
@@ -296,7 +377,14 @@ mc.listen("onJoin", function (pl) {
             } catch (e) {}
         }
         let myName = playerData[pl.xuid];
-        if (myName) applySkin(pl, myName);
+        if (myName) {
+            // URL 皮肤如果本地缓存没了(换服/清过缓存)，补下一次再套
+            if (isUrl(myName) && !loadSkin(myName)) {
+                ensureUrlSkin(myName, function (ok) { if (ok) applySkin(pl, myName); });
+            } else {
+                applySkin(pl, myName);
+            }
+        }
     }, 1000);
 });
 
@@ -666,16 +754,40 @@ mc.listen("onServerStarted", function () {
             case "set": {
                 let targets = res.target;
                 if (!targets || !targets.length) return out.error("§c没找到目标玩家");
-                if (!loadSkin(res.skinName)) return out.error("§c没有这个皮肤：" + res.skinName);
+                let nameOrUrl = res.skinName;
+                // URL 皮肤：要先异步下载，下好了再套；命令先即时回个"下载中"
+                if (isUrl(nameOrUrl)) {
+                    if (!isSafeUrl(nameOrUrl)) return out.error("§cURL 不合法或含特殊字符");
+                    let xuids = [];
+                    for (let i = 0; i < targets.length; i++) xuids.push(targets[i].xuid);
+                    out.success("§e正在下载 URL 皮肤，请稍候…");
+                    ensureUrlSkin(nameOrUrl, function (ok, err) {
+                        if (!ok) {
+                            if (executor) { try { executor.tell("§cURL 皮肤下载失败：" + err); } catch (e) {} }
+                            else logger.error("[skin] URL 皮肤下载失败：" + err);
+                            return;
+                        }
+                        let n = 0;
+                        for (let i = 0; i < xuids.length; i++) {
+                            let p = getOnlineByXuid(xuids[i]);
+                            if (p && applySkin(p, nameOrUrl)) { playerData[xuids[i]] = nameOrUrl; n++; }
+                        }
+                        saveData();
+                        let msg = "§a已给 " + n + " 个玩家设置 URL 皮肤";
+                        if (executor) { try { executor.tell(msg); } catch (e) {} } else logger.info("[skin] " + msg);
+                    });
+                    return;
+                }
+                if (!loadSkin(nameOrUrl)) return out.error("§c没有这个皮肤：" + nameOrUrl);
                 let n = 0;
                 for (let i = 0; i < targets.length; i++) {
-                    if (applySkin(targets[i], res.skinName)) {
-                        playerData[targets[i].xuid] = res.skinName;
+                    if (applySkin(targets[i], nameOrUrl)) {
+                        playerData[targets[i].xuid] = nameOrUrl;
                         n++;
                     }
                 }
                 saveData();
-                return out.success("§a已给 " + n + " 个玩家设置皮肤：" + res.skinName);
+                return out.success("§a已给 " + n + " 个玩家设置皮肤：" + nameOrUrl);
             }
             case "clear": {
                 let targets = res.target;
@@ -719,7 +831,18 @@ mc.listen("onServerStarted", function () {
 // ==================== 导出接口(命名空间 SkinAPI) ====================
 // 别的插件 ll.imports("SkinAPI", "xxx") 就能调下面这些
 function api_setSkin(player, skinName) {
-    if (!player || !skinName || !loadSkin(skinName)) return false;
+    if (!player || !skinName) return false;
+    // URL 皮肤是异步下载，这里接受请求后台下，下好自动套上并记录，返回 true 表示已受理
+    if (isUrl(skinName)) {
+        let xuid = player.xuid;
+        ensureUrlSkin(skinName, function (ok) {
+            if (!ok) return;
+            let p = getOnlineByXuid(xuid);
+            if (p && applySkin(p, skinName)) { playerData[xuid] = skinName; saveData(); }
+        });
+        return true;
+    }
+    if (!loadSkin(skinName)) return false;
     if (!applySkin(player, skinName)) return false;
     playerData[player.xuid] = skinName;
     saveData();

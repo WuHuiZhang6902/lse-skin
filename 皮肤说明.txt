@@ -3,6 +3,9 @@
 
 命令(需要 OP / 管理员)：
   /skin set <玩家> <皮肤名>   给玩家套上皮肤，会广播给所有人，并记下来
+                              <皮肤名> 也可以直接写一个 png 图片的 URL(http/https)，
+                              插件会用 curl 把图下到 skins/.urlcache/ 再套上(只支持 2D，没有自定义模型)。
+                              例：/skin set Steve https://example.com/abc.png
   /skin clear <玩家>          清掉记录，该玩家重新进服后变回原皮肤
   /skin list                  列出 skins 目录里能用的皮肤
   /skin reload                重新扫描 skins 目录并把已设置的皮肤重发一遍
@@ -17,6 +20,11 @@ GMLIB-LegacyRemoteCallApi；/skin mem 还需要 iListenAttentively-LseExport。
 新玩家进服时会自动从玩家列表拿到正确皮肤。设置过的皮肤存进 players.json，玩家退了再进会自动补上。
 
 show 命令发 AddPlayer 包，造一个只有你自己看得到的假人来预览皮肤，不占服务器实体。
+
+URL 皮肤：set 的皮肤名传 http/https 的 png 链接时，插件用系统的 curl 下到 skins/.urlcache/
+(文件名按链接算 hash，同一链接复用)。需要系统有 curl(Win10+/Linux 自带)。下好后跟普通皮肤一样存进
+players.json，玩家退进会自动补；缓存还在就不重复下。注意 URL 只支持 2D 普通皮肤，不带自定义模型；
+换了同一个链接背后的图想刷新，把 skins/.urlcache/ 里对应文件删了再 set 一次。
 
 
 皮肤怎么放
