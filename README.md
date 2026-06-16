@@ -19,8 +19,8 @@
 ## 前置依赖
 
 - [LegacyScriptEngine (QuickJS)](https://github.com/LiteLDev/LegacyScriptEngine)
-- [GMLIB-LegacyRemoteCallApi](https://github.com/GroupMountain/GMLIB)（发包必需）
-- [iListenAttentively-LseExport](https://github.com/MiracleForest/iListenAttentively-Wiki)（`/skin clear` 即时还原原皮需要，要求其 `getString` 支持 base64 参数）
+- [GMLIB-LegacyRemoteCallApi](https://github.com/GroupMountain/GMLIB-LegacyRemoteCallApi)（发包必需）
+- [iListenAttentively-LseExport](https://github.com/MiracleForest/iListenAttentively-LseExport)（`/skin clear` 即时还原原皮需要，要求其 `getString` 支持 base64 参数）
 - 系统自带 **curl**（Win10+ / Linux 都有）：URL 在线皮肤需要
 
 ## 安装
