@@ -1,8 +1,9 @@
 # skin —— LeviLamina / LSE 皮肤管理插件
 
 给 Minecraft 基岩版服务器（LeviLamina + LegacyScriptEngine QuickJS）用的皮肤插件。
-管理员可以给玩家换皮肤，支持普通皮肤（单张 png）和 **4D 皮肤**（png + 自定义 geometry 模型），
-全程纯发包实现，并提供给其他插件调用的接口。
+管理员可以给玩家换皮肤，支持普通皮肤（单张 png）和 **4D 皮肤**（png + 自定义 geometry 模型）。
+换肤、预览都走 GMLIB 二进制流发包实现；另外带一个实验性的内存改皮肤功能（`/skin mem`，需要
+iListenAttentively），并提供给其他插件调用的接口。
 
 > 作者：干物社（QQ 2063665699）、子沐呀（QQ 1756150362）
 
@@ -13,7 +14,7 @@
 - 玩家退出后再进服自动补回已设置的皮肤
 - `/skin show` 在自己面前临时生成假人预览皮肤（只自己可见，不占服务器实体）
 - `/skin mem` 实验性：用 iListenAttentively 直接改服务器内存里的皮肤（`SerializedSkinImpl::read`）
-- 全程走 GMLIB 二进制流发包，包头按版本对应，跨版本更稳
+- 换肤 / 预览走 GMLIB 二进制流发包，包头按版本对应，跨版本更稳
 - 通过 `ll.exports` 暴露 `SkinAPI` 给其他插件调用
 
 ## 前置依赖
